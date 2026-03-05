@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from metrics import add_derived_metrics
+from metrics import add_derived_metrics, match_data_quality_summary
 
 RAW_DIR = Path("data/raw")
 FRIENDS_PATH = Path("data/friends.json")
@@ -351,6 +351,21 @@ df = load_all_matches(str(RAW_DIR))
 if df.empty:
     st.warning("No match JSON files found in data/raw (expected matches_*_*.json).")
     st.stop()
+
+# Status line
+status_bits = []
+status_bits.append(f"Raw files: {len(scan_raw_files())}")
+status_bits.append("Heroes ✅" if HEROES_JSON.exists() else ("Heroes ⚠️" if HEROES_PARQUET.exists() else "Heroes ❌"))
+st.caption(" • ".join(status_bits))
+
+# Data quality summary
+quality = match_data_quality_summary(df)
+q1, q2, q3 = st.columns(3)
+q1.metric("Rows", quality["total_rows"])
+q2.metric("Valid", quality["valid_rows"])
+q3.metric("Invalid", quality["invalid_rows"])
+if quality["required_missing_columns"]:
+    st.warning(f"Missing required columns: {', '.join(quality['required_missing_columns'])}")
 
 # Sidebar filters
 st.sidebar.header("Filters")
