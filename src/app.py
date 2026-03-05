@@ -187,7 +187,17 @@ def load_hero_dict() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=True)
 def load_all_matches(raw_dir: str) -> pd.DataFrame:
-    raw_files = scan_raw_files()
+    base_dir = Path(raw_dir)
+    raw_files = []
+    for p in sorted(base_dir.glob("matches_*_*.json")):
+        m = RAW_FILE_RE.match(p.name)
+        if not m:
+            continue
+        raw_files.append({
+            "name": m.group("name"),
+            "account_id": int(m.group("account_id")),
+            "path": p,
+        })
     if not raw_files:
         return pd.DataFrame()
 
@@ -424,6 +434,8 @@ with tabs[1]:
                    avg_kda=("kda", "mean"),
                    avg_cs_per_min=("cs_per_min", "mean"),
                    avg_souls_per_min=("souls_per_min", "mean"),
+                   avg_deaths_per_min=("deaths_per_min", "mean"),
+                   avg_assist_ratio=("assist_ratio", "mean"),
                    hero_icon_small=("hero_icon_small", "first"),
                    hero_card=("hero_card", "first"),
                    hero_portrait=("hero_portrait", "first"),
