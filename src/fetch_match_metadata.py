@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import json
-import os
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from http_client import get_json
 
@@ -24,7 +22,7 @@ META_DIR.mkdir(parents=True, exist_ok=True)
 #   /v1/matches/{match_id}/metadata
 #
 # Put your actual Scalar path here:
-MATCH_META_ENDPOINT_TEMPLATE = "/v1/matches/metadata"
+MATCH_META_ENDPOINT_TEMPLATE = "/v1/matches/{match_id}/metadata"
 
 
 # ------------------------
@@ -55,7 +53,7 @@ def load_friends() -> List[dict]:
 def friend_raw_file(friend_label: str, account_id: int) -> Path:
     # Match your existing naming convention if different
     # e.g. Jake_105260527.json
-    return RAW_DIR / f"{friend_label}_{account_id}.json"
+    return RAW_DIR / f"matches_{friend_label}_{account_id}.json"
 
 
 def friend_meta_file(friend_label: str, account_id: int) -> Path:
@@ -122,34 +120,19 @@ def normalize_meta_response(match_id: int, payload: Any) -> dict:
     return {"match_id": match_id, "payload": payload}
 
 
-def fetch_one_meta(match_id: int, max_retries: int = 6) -> Optional[dict]:
+def fetch_one_meta(match_id: int) -> Optional[dict]:
     """
     Fetch match metadata with basic backoff handling for 429 and transient errors.
     """
     endpoint = MATCH_META_ENDPOINT_TEMPLATE.format(match_id=match_id)
 
-    delay = 2.0
-    for attempt in range(1, max_retries + 1):
-        try:
-            data = get_json(endpoint)
-            return normalize_meta_response(match_id, data)
-        except Exception as e:
-            msg = str(e)
-            # crude detection (works with your existing http_client exception messages)
-            is_429 = ("429" in msg) or ("rate" in msg.lower()) or ("quota" in msg.lower())
-            if attempt == max_retries:
-                print(f"  !! Failed match_id={match_id} after {max_retries} tries: {e}")
-                return None
-
-            if is_429:
-                print(f"  .. 429/rate limit for match_id={match_id}, backing off {delay:.1f}s (attempt {attempt})")
-            else:
-                print(f"  .. error for match_id={match_id}: {e} (attempt {attempt}), retrying in {delay:.1f}s")
-
-            time.sleep(delay)
-            delay = min(delay * 1.8, 60.0)
-
-    return None
+    # get_json() already includes retry/backoff for transient failures and 429s.
+    try:
+        data = get_json(endpoint)
+        return normalize_meta_response(match_id, data)
+    except Exception as e:
+        print(f"  !! Failed match_id={match_id} after HTTP client retries: {e}")
+        return None
 
 
 # ------------------------
