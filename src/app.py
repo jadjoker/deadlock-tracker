@@ -132,13 +132,25 @@ def load_hero_dict() -> pd.DataFrame:
                 ])
 
                 meta: dict[str, Any] = {}
-                for key in [
+                prioritized_keys = [
                     "role", "roles", "difficulty", "class", "type",
                     "faction", "description", "tagline",
                     "primary_attribute", "attributes",
-                ]:
+                    "lore", "abilities", "weapon", "stats", "release_date",
+                ]
+                for key in prioritized_keys:
                     if key in h and h.get(key) not in (None, "", [], {}):
                         meta[key] = h.get(key)
+
+                # Include any other useful top-level hero fields (excluding IDs, display name, and images).
+                for key, value in h.items():
+                    if key in {"id", "name", "images"}:
+                        continue
+                    if key in meta:
+                        continue
+                    if value in (None, "", [], {}):
+                        continue
+                    meta[key] = value
 
                 rows.append({
                     "hero_id": hid,
@@ -545,17 +557,6 @@ with tabs[1]:
         table_cols = [c for c in table_cols if c in hero_summary.columns]
         st.dataframe(make_arrow_safe(hero_summary[table_cols]), width="stretch", hide_index=True)
 
-        st.markdown("#### Pick a hero from the table")
-        hero_options = ["(All heroes)"] + hero_summary["hero_display"].tolist()
-        picked = st.selectbox(
-            "Jump to hero",
-            hero_options,
-            index=0 if selected_hero == "(All heroes)" else (hero_options.index(selected_hero) if selected_hero in hero_options else 0),
-            key=f"{key}_picker",
-        )
-        if picked != selected_hero:
-            st.session_state[key] = picked
-            st.rerun()
 
 
 # ---------------------------
@@ -588,6 +589,7 @@ with tabs[2]:
 # ---------------------------
 with tabs[3]:
     st.subheader("Hero Browser")
+    st.caption("Browse hero art + a cleaned metadata view from data/heroes.json.")
 
     heroes = (
         df[["hero_id", "hero_display", "hero_icon_small", "hero_card", "hero_portrait", "hero_meta_json"]]
@@ -602,13 +604,31 @@ with tabs[3]:
     colA, colB = st.columns([1, 2], gap="large")
     with colA:
         img = ""
-        for candidate in [hrow.get("hero_card", ""), hrow.get("hero_portrait", ""), hrow.get("hero_icon_small", "")]:
+        for candidate in [hrow.get("hero_icon_small", ""), hrow.get("hero_card", ""), hrow.get("hero_portrait", "")]:
             if isinstance(candidate, str) and candidate:
                 img = candidate
                 break
-        if img:
-            st.image(img, use_container_width=True)
-        st.markdown(f"**Hero ID:** {int(hrow['hero_id'])}")
+
+        with st.container(border=True):
+            if img:
+                st.image(img, width=120)
+            else:
+                st.write("No hero image available")
+            st.markdown(f"**{hrow['hero_display']}**")
+            st.caption(f"Hero ID: {int(hrow['hero_id'])}")
+
+        image_rows = []
+        for label, url in [
+            ("Icon", hrow.get("hero_icon_small", "")),
+            ("Card", hrow.get("hero_card", "")),
+            ("Portrait", hrow.get("hero_portrait", "")),
+        ]:
+            if isinstance(url, str) and url:
+                image_rows.append({"image_type": label, "url": url})
+
+        if image_rows:
+            st.markdown("#### Image URLs")
+            st.dataframe(make_arrow_safe(pd.DataFrame(image_rows)), width="stretch", hide_index=True)
 
     with colB:
         st.markdown("### Metadata")
@@ -616,8 +636,29 @@ with tabs[3]:
             meta_obj = json.loads(hrow.get("hero_meta_json", "{}"))
         except Exception:
             meta_obj = {}
+
         if meta_obj:
-            meta_items = [{"field": k, "value": meta_obj[k]} for k in meta_obj.keys()]
-            st.dataframe(make_arrow_safe(pd.DataFrame(meta_items)), width="stretch", hide_index=True)
+            preferred_order = [
+                "role", "roles", "difficulty", "class", "type", "faction",
+                "primary_attribute", "description", "tagline",
+            ]
+
+            summary_items = []
+            detail_items = []
+            for k, v in meta_obj.items():
+                target = summary_items if k in preferred_order else detail_items
+                target.append({"field": k, "value": v})
+
+            if summary_items:
+                st.markdown("#### Core hero details")
+                st.dataframe(make_arrow_safe(pd.DataFrame(summary_items)), width="stretch", hide_index=True)
+
+            if detail_items:
+                st.markdown("#### Additional hero fields")
+                st.dataframe(make_arrow_safe(pd.DataFrame(detail_items)), width="stretch", hide_index=True)
+
+            with st.expander("View raw hero metadata JSON"):
+                st.json(meta_obj)
         else:
             st.write("No hero metadata available.")
+
