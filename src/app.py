@@ -389,6 +389,7 @@ tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser"])
 # ---------------------------
 with tabs[0]:
     st.subheader("Leaderboard")
+    st.caption("Metric tips: Winrate = wins / matches • KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Assist Ratio = assists / (kills + assists)")
 
     summary = (
         fdf.groupby(["player_label"], as_index=False)
@@ -478,6 +479,7 @@ with tabs[1]:
         d1, d2 = st.columns(2)
         d1.metric("Avg Deaths/min", f"{pdf['deaths_per_min'].mean():.2f}")
         d2.metric("Avg Assist Ratio", f"{pdf['assist_ratio'].mean():.2f}")
+        st.caption("Metric tips: KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Deaths/min = deaths / match_minutes • Assist Ratio = assists / (kills + assists)")
 
         st.markdown("#### Win rate by game length")
 
@@ -590,6 +592,7 @@ with tabs[1]:
 # ---------------------------
 with tabs[2]:
     st.subheader("Hero Meta (group)")
+    st.caption("Averages are per-match means across the currently filtered players and modes.")
 
     meta = (
         fdf.groupby(["hero_id", "hero_display"], as_index=False)
