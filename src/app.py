@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from metrics import add_derived_metrics, match_data_quality_summary
+
 RAW_DIR = Path("data/raw")
 FRIENDS_PATH = Path("data/friends.json")
 
@@ -276,20 +278,7 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
 
     # Derived fields
     df["start_dt"] = pd.to_datetime(df["start_time"], unit="s", utc=True).dt.tz_convert("America/New_York")
-    df["duration_min"] = (df["match_duration_s"] / 60.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    df["kda"] = (df["player_kills"] + df["player_assists"]) / df["player_deaths"].replace(0, 1)
-    df["is_win"] = df["match_result"] == 1
-
-    df["cs"] = df["last_hits"] + df["denies"]
-    df["cs_per_min"] = (df["cs"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    df["souls"] = df["net_worth"]
-    df["souls_per_min"] = (df["souls"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    # New derived metrics
-    df["deaths_per_min"] = (df["player_deaths"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-    df["assist_ratio"] = (df["player_assists"] / (df["player_kills"] + df["player_assists"]).replace(0, np.nan)).fillna(0.0)
+    df = add_derived_metrics(df)
 
     # Heroes
     heroes_df = load_hero_dict()
@@ -336,8 +325,8 @@ def short_label(name: str, max_len: int = 14) -> str:
 # UI
 # ---------------------------
 
-st.set_page_config(page_title="Deadlock Friend Tracker", layout="wide")
-st.title("Deadlock Friend Tracker")
+st.set_page_config(page_title="Deadcock Tracker", layout="wide")
+st.title("Deadcock Tracker")
 
 
 st.markdown(
@@ -368,6 +357,15 @@ status_bits = []
 status_bits.append(f"Raw files: {len(scan_raw_files())}")
 status_bits.append("Heroes ✅" if HEROES_JSON.exists() else ("Heroes ⚠️" if HEROES_PARQUET.exists() else "Heroes ❌"))
 st.caption(" • ".join(status_bits))
+
+# Data quality summary
+quality = match_data_quality_summary(df)
+q1, q2, q3 = st.columns(3)
+q1.metric("Rows", quality["total_rows"])
+q2.metric("Valid", quality["valid_rows"])
+q3.metric("Invalid", quality["invalid_rows"])
+if quality["required_missing_columns"]:
+    st.warning(f"Missing required columns: {', '.join(quality['required_missing_columns'])}")
 
 # Sidebar filters
 st.sidebar.header("Filters")
