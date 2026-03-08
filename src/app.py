@@ -765,3 +765,4 @@ with tabs[3]:
                 st.json(meta_obj)
         else:
             st.write("No hero metadata available.")
+
