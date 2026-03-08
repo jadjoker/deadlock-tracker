@@ -14,6 +14,10 @@ from metrics import add_derived_metrics
 
 RAW_DIR = Path("data/raw")
 FRIENDS_PATH = Path("data/friends.json")
+PLAYER_STATS_GLOBS = [
+    "player_hero_stats_*_*.json",  # preferred naming: player_hero_stats_<Name>_<account_id>.json
+    "player_stats*.json",          # backwards-compatible fallback
+]
 
 HEROES_JSON = Path("data/heroes.json")
 HEROES_PARQUET = Path("data/heroes.parquet")  # optional fallback
@@ -60,6 +64,36 @@ def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
             )
             out[col] = out[col].fillna("").astype(str)
     return out
+
+
+def _collect_account_records(obj: Any) -> list[dict[str, Any]]:
+    """Recursively collect dict objects that contain an account_id."""
+    out: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        if "account_id" in obj:
+            out.append(obj)
+        for v in obj.values():
+            out.extend(_collect_account_records(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_account_records(item))
+    return out
+
+
+def _flatten_to_rows(obj: Any, prefix: str = "") -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            rows.extend(_flatten_to_rows(v, key))
+    elif isinstance(obj, list):
+        if obj and all(not isinstance(x, (dict, list)) for x in obj):
+            rows.append({"field": prefix or "value", "value": ", ".join(map(str, obj))})
+        else:
+            rows.append({"field": prefix or "value", "value": json.dumps(obj, ensure_ascii=False)})
+    else:
+        rows.append({"field": prefix or "value", "value": "" if obj is None else str(obj)})
+    return rows
 
 
 def _state_key(player_label: str) -> str:
@@ -297,6 +331,51 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner=False)
+def load_player_stats(raw_dir: str) -> pd.DataFrame:
+    """
+    Loads optional deeper player stats JSON files from data/raw matching PLAYER_STATS_GLOBS.
+    Expected to include account_id somewhere in each record.
+    """
+    base_dir = Path(raw_dir)
+    files: list[Path] = []
+    for pattern in PLAYER_STATS_GLOBS:
+        files.extend(base_dir.glob(pattern))
+    files = sorted(set(files))
+    if not files:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    rows: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        recs = _collect_account_records(payload)
+        for rec in recs:
+            aid = _safe_int(rec.get("account_id"), default=0)
+            if aid <= 0:
+                continue
+            rows.append(
+                {
+                    "account_id": aid,
+                    "player_stats_json": json.dumps(rec, ensure_ascii=False),
+                    "player_stats_source": p.name,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["account_id"], keep="last").reset_index(drop=True)
+    out["account_id"] = out["account_id"].astype(int)
+    out["player_stats_json"] = out["player_stats_json"].astype(str)
+    out["player_stats_source"] = out["player_stats_source"].astype(str)
+    return out
+
+
 
 def hero_icon_path(hero_id: int) -> str:
     """Return path to hero icon if it exists."""
@@ -346,6 +425,7 @@ st.markdown(
 
 
 df = load_all_matches(str(RAW_DIR))
+player_stats_df = load_player_stats(str(RAW_DIR))
 if df.empty:
     st.warning("No match JSON files found in data/raw (expected matches_*_*.json).")
     st.stop()
@@ -463,6 +543,30 @@ with tabs[1]:
         d1.metric("Avg Deaths/min", f"{pdf['deaths_per_min'].mean():.2f}")
         d2.metric("Avg Assist Ratio", f"{pdf['assist_ratio'].mean():.2f}")
         st.caption("Metric tips: KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Deaths/min = deaths / match_minutes • Assist Ratio = assists / (kills + assists)")
+
+        st.markdown("#### Player Stats (raw JSON link by account_id)")
+        player_account_ids = sorted({_safe_int(x) for x in pdf_all["account_id"].unique().tolist() if _safe_int(x) > 0})
+        pstats = player_stats_df[player_stats_df["account_id"].isin(player_account_ids)].copy()
+        if pstats.empty:
+            st.caption(
+                f"No stats files found matching {PLAYER_STATS_GLOBS} in {RAW_DIR}. "
+                "Add one or more files with records containing account_id."
+            )
+        else:
+            stats_row = pstats.iloc[0]
+            st.caption(f"Source: {stats_row['player_stats_source']}")
+            try:
+                stats_obj = json.loads(stats_row["player_stats_json"])
+            except Exception:
+                stats_obj = {}
+
+            if isinstance(stats_obj, dict):
+                stats_obj = {k: v for k, v in stats_obj.items() if k != "account_id"}
+            stats_rows = _flatten_to_rows(stats_obj)
+            if stats_rows:
+                st.dataframe(make_arrow_safe(pd.DataFrame(stats_rows)), width="stretch", hide_index=True)
+            else:
+                st.write("No displayable stats fields found for this player.")
 
         st.markdown("#### Win rate by game length")
 
