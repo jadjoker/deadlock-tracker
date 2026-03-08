@@ -10,8 +10,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from metrics import add_derived_metrics
+
 RAW_DIR = Path("data/raw")
 FRIENDS_PATH = Path("data/friends.json")
+PLAYER_STATS_GLOBS = [
+    "player_hero_stats_*_*.json",  # preferred naming: player_hero_stats_<Name>_<account_id>.json
+    "player_stats*.json",          # backwards-compatible fallback
+]
 
 HEROES_JSON = Path("data/heroes.json")
 HEROES_PARQUET = Path("data/heroes.parquet")  # optional fallback
@@ -60,18 +66,34 @@ def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def scan_raw_files() -> List[dict]:
-    out: List[dict] = []
-    for p in sorted(RAW_DIR.glob("matches_*_*.json")):
-        m = RAW_FILE_RE.match(p.name)
-        if not m:
-            continue
-        out.append({
-            "name": m.group("name"),
-            "account_id": int(m.group("account_id")),
-            "path": p,
-        })
+def _collect_account_records(obj: Any) -> list[dict[str, Any]]:
+    """Recursively collect dict objects that contain an account_id."""
+    out: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        if "account_id" in obj:
+            out.append(obj)
+        for v in obj.values():
+            out.extend(_collect_account_records(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_account_records(item))
     return out
+
+
+def _flatten_to_rows(obj: Any, prefix: str = "") -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            rows.extend(_flatten_to_rows(v, key))
+    elif isinstance(obj, list):
+        if obj and all(not isinstance(x, (dict, list)) for x in obj):
+            rows.append({"field": prefix or "value", "value": ", ".join(map(str, obj))})
+        else:
+            rows.append({"field": prefix or "value", "value": json.dumps(obj, ensure_ascii=False)})
+    else:
+        rows.append({"field": prefix or "value", "value": "" if obj is None else str(obj)})
+    return rows
 
 
 def _state_key(player_label: str) -> str:
@@ -144,13 +166,25 @@ def load_hero_dict() -> pd.DataFrame:
                 ])
 
                 meta: dict[str, Any] = {}
-                for key in [
+                prioritized_keys = [
                     "role", "roles", "difficulty", "class", "type",
                     "faction", "description", "tagline",
                     "primary_attribute", "attributes",
-                ]:
+                    "lore", "abilities", "weapon", "stats", "release_date",
+                ]
+                for key in prioritized_keys:
                     if key in h and h.get(key) not in (None, "", [], {}):
                         meta[key] = h.get(key)
+
+                # Include any other useful top-level hero fields (excluding IDs, display name, and images).
+                for key, value in h.items():
+                    if key in {"id", "name", "images"}:
+                        continue
+                    if key in meta:
+                        continue
+                    if value in (None, "", [], {}):
+                        continue
+                    meta[key] = value
 
                 rows.append({
                     "hero_id": hid,
@@ -187,7 +221,17 @@ def load_hero_dict() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=True)
 def load_all_matches(raw_dir: str) -> pd.DataFrame:
-    raw_files = scan_raw_files()
+    base_dir = Path(raw_dir)
+    raw_files = []
+    for p in sorted(base_dir.glob("matches_*_*.json")):
+        m = RAW_FILE_RE.match(p.name)
+        if not m:
+            continue
+        raw_files.append({
+            "name": m.group("name"),
+            "account_id": int(m.group("account_id")),
+            "path": p,
+        })
     if not raw_files:
         return pd.DataFrame()
 
@@ -266,20 +310,7 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
 
     # Derived fields
     df["start_dt"] = pd.to_datetime(df["start_time"], unit="s", utc=True).dt.tz_convert("America/New_York")
-    df["duration_min"] = (df["match_duration_s"] / 60.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    df["kda"] = (df["player_kills"] + df["player_assists"]) / df["player_deaths"].replace(0, 1)
-    df["is_win"] = df["match_result"] == 1
-
-    df["cs"] = df["last_hits"] + df["denies"]
-    df["cs_per_min"] = (df["cs"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    df["souls"] = df["net_worth"]
-    df["souls_per_min"] = (df["souls"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    # New derived metrics
-    df["deaths_per_min"] = (df["player_deaths"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-    df["assist_ratio"] = (df["player_assists"] / (df["player_kills"] + df["player_assists"]).replace(0, np.nan)).fillna(0.0)
+    df = add_derived_metrics(df)
 
     # Heroes
     heroes_df = load_hero_dict()
@@ -298,6 +329,51 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
         df["hero_meta_json"] = df["hero_meta_json"].fillna("{}")
 
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_player_stats(raw_dir: str) -> pd.DataFrame:
+    """
+    Loads optional deeper player stats JSON files from data/raw matching PLAYER_STATS_GLOBS.
+    Expected to include account_id somewhere in each record.
+    """
+    base_dir = Path(raw_dir)
+    files: list[Path] = []
+    for pattern in PLAYER_STATS_GLOBS:
+        files.extend(base_dir.glob(pattern))
+    files = sorted(set(files))
+    if not files:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    rows: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        recs = _collect_account_records(payload)
+        for rec in recs:
+            aid = _safe_int(rec.get("account_id"), default=0)
+            if aid <= 0:
+                continue
+            rows.append(
+                {
+                    "account_id": aid,
+                    "player_stats_json": json.dumps(rec, ensure_ascii=False),
+                    "player_stats_source": p.name,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["account_id"], keep="last").reset_index(drop=True)
+    out["account_id"] = out["account_id"].astype(int)
+    out["player_stats_json"] = out["player_stats_json"].astype(str)
+    out["player_stats_source"] = out["player_stats_source"].astype(str)
+    return out
 
 
 
@@ -326,8 +402,8 @@ def short_label(name: str, max_len: int = 14) -> str:
 # UI
 # ---------------------------
 
-st.set_page_config(page_title="Deadlock Friend Tracker", layout="wide")
-st.title("Deadlock Friend Tracker")
+st.set_page_config(page_title="Deadcock Tracker", layout="wide")
+st.title("Deadcock Tracker")
 
 
 st.markdown(
@@ -349,15 +425,10 @@ st.markdown(
 
 
 df = load_all_matches(str(RAW_DIR))
+player_stats_df = load_player_stats(str(RAW_DIR))
 if df.empty:
     st.warning("No match JSON files found in data/raw (expected matches_*_*.json).")
     st.stop()
-
-# Status line
-status_bits = []
-status_bits.append(f"Raw files: {len(scan_raw_files())}")
-status_bits.append("Heroes ✅" if HEROES_JSON.exists() else ("Heroes ⚠️" if HEROES_PARQUET.exists() else "Heroes ❌"))
-st.caption(" • ".join(status_bits))
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -381,6 +452,7 @@ tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser"])
 # ---------------------------
 with tabs[0]:
     st.subheader("Leaderboard")
+    st.caption("Metric tips: Winrate = wins / matches • KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Assist Ratio = assists / (kills + assists)")
 
     summary = (
         fdf.groupby(["player_label"], as_index=False)
@@ -424,6 +496,8 @@ with tabs[1]:
                    avg_kda=("kda", "mean"),
                    avg_cs_per_min=("cs_per_min", "mean"),
                    avg_souls_per_min=("souls_per_min", "mean"),
+                   avg_deaths_per_min=("deaths_per_min", "mean"),
+                   avg_assist_ratio=("assist_ratio", "mean"),
                    hero_icon_small=("hero_icon_small", "first"),
                    hero_card=("hero_card", "first"),
                    hero_portrait=("hero_portrait", "first"),
@@ -468,6 +542,31 @@ with tabs[1]:
         d1, d2 = st.columns(2)
         d1.metric("Avg Deaths/min", f"{pdf['deaths_per_min'].mean():.2f}")
         d2.metric("Avg Assist Ratio", f"{pdf['assist_ratio'].mean():.2f}")
+        st.caption("Metric tips: KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Deaths/min = deaths / match_minutes • Assist Ratio = assists / (kills + assists)")
+
+        st.markdown("#### Player Stats (raw JSON link by account_id)")
+        player_account_ids = sorted({_safe_int(x) for x in pdf_all["account_id"].unique().tolist() if _safe_int(x) > 0})
+        pstats = player_stats_df[player_stats_df["account_id"].isin(player_account_ids)].copy()
+        if pstats.empty:
+            st.caption(
+                f"No stats files found matching {PLAYER_STATS_GLOBS} in {RAW_DIR}. "
+                "Add one or more files with records containing account_id."
+            )
+        else:
+            stats_row = pstats.iloc[0]
+            st.caption(f"Source: {stats_row['player_stats_source']}")
+            try:
+                stats_obj = json.loads(stats_row["player_stats_json"])
+            except Exception:
+                stats_obj = {}
+
+            if isinstance(stats_obj, dict):
+                stats_obj = {k: v for k, v in stats_obj.items() if k != "account_id"}
+            stats_rows = _flatten_to_rows(stats_obj)
+            if stats_rows:
+                st.dataframe(make_arrow_safe(pd.DataFrame(stats_rows)), width="stretch", hide_index=True)
+            else:
+                st.write("No displayable stats fields found for this player.")
 
         st.markdown("#### Win rate by game length")
 
@@ -562,17 +661,6 @@ with tabs[1]:
         table_cols = [c for c in table_cols if c in hero_summary.columns]
         st.dataframe(make_arrow_safe(hero_summary[table_cols]), width="stretch", hide_index=True)
 
-        st.markdown("#### Pick a hero from the table")
-        hero_options = ["(All heroes)"] + hero_summary["hero_display"].tolist()
-        picked = st.selectbox(
-            "Jump to hero",
-            hero_options,
-            index=0 if selected_hero == "(All heroes)" else (hero_options.index(selected_hero) if selected_hero in hero_options else 0),
-            key=f"{key}_picker",
-        )
-        if picked != selected_hero:
-            st.session_state[key] = picked
-            st.rerun()
 
 
 # ---------------------------
@@ -580,6 +668,7 @@ with tabs[1]:
 # ---------------------------
 with tabs[2]:
     st.subheader("Hero Meta (group)")
+    st.caption("Averages are per-match means across the currently filtered players and modes.")
 
     meta = (
         fdf.groupby(["hero_id", "hero_display"], as_index=False)
@@ -604,6 +693,7 @@ with tabs[2]:
 # ---------------------------
 with tabs[3]:
     st.subheader("Hero Browser")
+    st.caption("Browse hero art + a cleaned metadata view from data/heroes.json.")
 
     heroes = (
         df[["hero_id", "hero_display", "hero_icon_small", "hero_card", "hero_portrait", "hero_meta_json"]]
@@ -618,13 +708,31 @@ with tabs[3]:
     colA, colB = st.columns([1, 2], gap="large")
     with colA:
         img = ""
-        for candidate in [hrow.get("hero_card", ""), hrow.get("hero_portrait", ""), hrow.get("hero_icon_small", "")]:
+        for candidate in [hrow.get("hero_icon_small", ""), hrow.get("hero_card", ""), hrow.get("hero_portrait", "")]:
             if isinstance(candidate, str) and candidate:
                 img = candidate
                 break
-        if img:
-            st.image(img, use_container_width=True)
-        st.markdown(f"**Hero ID:** {int(hrow['hero_id'])}")
+
+        with st.container(border=True):
+            if img:
+                st.image(img, width=120)
+            else:
+                st.write("No hero image available")
+            st.markdown(f"**{hrow['hero_display']}**")
+            st.caption(f"Hero ID: {int(hrow['hero_id'])}")
+
+        image_rows = []
+        for label, url in [
+            ("Icon", hrow.get("hero_icon_small", "")),
+            ("Card", hrow.get("hero_card", "")),
+            ("Portrait", hrow.get("hero_portrait", "")),
+        ]:
+            if isinstance(url, str) and url:
+                image_rows.append({"image_type": label, "url": url})
+
+        if image_rows:
+            st.markdown("#### Image URLs")
+            st.dataframe(make_arrow_safe(pd.DataFrame(image_rows)), width="stretch", hide_index=True)
 
     with colB:
         st.markdown("### Metadata")
@@ -632,8 +740,28 @@ with tabs[3]:
             meta_obj = json.loads(hrow.get("hero_meta_json", "{}"))
         except Exception:
             meta_obj = {}
+
         if meta_obj:
-            meta_items = [{"field": k, "value": meta_obj[k]} for k in meta_obj.keys()]
-            st.dataframe(make_arrow_safe(pd.DataFrame(meta_items)), width="stretch", hide_index=True)
+            preferred_order = [
+                "role", "roles", "difficulty", "class", "type", "faction",
+                "primary_attribute", "description", "tagline",
+            ]
+
+            summary_items = []
+            detail_items = []
+            for k, v in meta_obj.items():
+                target = summary_items if k in preferred_order else detail_items
+                target.append({"field": k, "value": v})
+
+            if summary_items:
+                st.markdown("#### Core hero details")
+                st.dataframe(make_arrow_safe(pd.DataFrame(summary_items)), width="stretch", hide_index=True)
+
+            if detail_items:
+                st.markdown("#### Additional hero fields")
+                st.dataframe(make_arrow_safe(pd.DataFrame(detail_items)), width="stretch", hide_index=True)
+
+            with st.expander("View raw hero metadata JSON"):
+                st.json(meta_obj)
         else:
             st.write("No hero metadata available.")
