@@ -344,6 +344,7 @@ st.markdown(
 
 
 df = load_all_matches(str(RAW_DIR))
+player_hero_stats_raw_df = load_player_hero_stats(str(RAW_DIR))
 if df.empty:
     st.warning("No match JSON files found in data/raw (expected matches_*_*.json).")
     st.stop()
@@ -362,7 +363,7 @@ if st.sidebar.button("Apply filters", key="apply_filters"):
 fdf = df[df["player_label"].isin(selected_players) & df["game_mode_display"].isin(selected_modes)].copy()
 players_filtered = sorted(fdf["player_label"].unique().tolist())
 
-tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser"])
+tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser", "Player Hero Stats"])
 
 
 # ---------------------------
