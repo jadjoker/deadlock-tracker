@@ -10,8 +10,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+from metrics import add_derived_metrics
+
 RAW_DIR = Path("data/raw")
 FRIENDS_PATH = Path("data/friends.json")
+PLAYER_STATS_GLOBS = [
+    "player_hero_stats_*_*.json",  # preferred naming: player_hero_stats_<Name>_<account_id>.json
+    "player_stats*.json",          # backwards-compatible fallback
+]
 
 HEROES_JSON = Path("data/heroes.json")
 HEROES_PARQUET = Path("data/heroes.parquet")  # optional fallback
@@ -60,18 +66,63 @@ def make_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def scan_raw_files() -> List[dict]:
-    out: List[dict] = []
-    for p in sorted(RAW_DIR.glob("matches_*_*.json")):
-        m = RAW_FILE_RE.match(p.name)
-        if not m:
-            continue
-        out.append({
-            "name": m.group("name"),
-            "account_id": int(m.group("account_id")),
-            "path": p,
-        })
+def _collect_account_records(obj: Any) -> list[dict[str, Any]]:
+    """Recursively collect dict objects that contain an account_id."""
+    out: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        if "account_id" in obj:
+            out.append(obj)
+        for v in obj.values():
+            out.extend(_collect_account_records(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_account_records(item))
     return out
+
+
+def _flatten_to_rows(obj: Any, prefix: str = "") -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            key = f"{prefix}.{k}" if prefix else str(k)
+            rows.extend(_flatten_to_rows(v, key))
+    elif isinstance(obj, list):
+        if obj and all(not isinstance(x, (dict, list)) for x in obj):
+            rows.append({"field": prefix or "value", "value": ", ".join(map(str, obj))})
+        else:
+            rows.append({"field": prefix or "value", "value": json.dumps(obj, ensure_ascii=False)})
+    else:
+        rows.append({"field": prefix or "value", "value": "" if obj is None else str(obj)})
+    return rows
+
+
+def _collect_hero_records(obj: Any, current_account_id: int | None = None) -> list[dict[str, Any]]:
+    """Recursively collect dict records that contain hero_id, carrying account_id context."""
+    out: list[dict[str, Any]] = []
+    if isinstance(obj, dict):
+        if "account_id" in obj:
+            current_account_id = _safe_int(obj.get("account_id"), default=current_account_id or 0)
+
+        if "hero_id" in obj:
+            rec = dict(obj)
+            if "account_id" not in rec and current_account_id is not None:
+                rec["account_id"] = current_account_id
+            out.append(rec)
+
+        for v in obj.values():
+            out.extend(_collect_hero_records(v, current_account_id=current_account_id))
+    elif isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_hero_records(item, current_account_id=current_account_id))
+    return out
+
+
+def _first_existing(cols: list[str], candidates: list[str]) -> str | None:
+    cset = set(cols)
+    for c in candidates:
+        if c in cset:
+            return c
+    return None
 
 
 def _state_key(player_label: str) -> str:
@@ -144,13 +195,25 @@ def load_hero_dict() -> pd.DataFrame:
                 ])
 
                 meta: dict[str, Any] = {}
-                for key in [
+                prioritized_keys = [
                     "role", "roles", "difficulty", "class", "type",
                     "faction", "description", "tagline",
                     "primary_attribute", "attributes",
-                ]:
+                    "lore", "abilities", "weapon", "stats", "release_date",
+                ]
+                for key in prioritized_keys:
                     if key in h and h.get(key) not in (None, "", [], {}):
                         meta[key] = h.get(key)
+
+                # Include any other useful top-level hero fields (excluding IDs, display name, and images).
+                for key, value in h.items():
+                    if key in {"id", "name", "images"}:
+                        continue
+                    if key in meta:
+                        continue
+                    if value in (None, "", [], {}):
+                        continue
+                    meta[key] = value
 
                 rows.append({
                     "hero_id": hid,
@@ -187,7 +250,17 @@ def load_hero_dict() -> pd.DataFrame:
 
 @st.cache_data(show_spinner=True)
 def load_all_matches(raw_dir: str) -> pd.DataFrame:
-    raw_files = scan_raw_files()
+    base_dir = Path(raw_dir)
+    raw_files = []
+    for p in sorted(base_dir.glob("matches_*_*.json")):
+        m = RAW_FILE_RE.match(p.name)
+        if not m:
+            continue
+        raw_files.append({
+            "name": m.group("name"),
+            "account_id": int(m.group("account_id")),
+            "path": p,
+        })
     if not raw_files:
         return pd.DataFrame()
 
@@ -266,20 +339,7 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
 
     # Derived fields
     df["start_dt"] = pd.to_datetime(df["start_time"], unit="s", utc=True).dt.tz_convert("America/New_York")
-    df["duration_min"] = (df["match_duration_s"] / 60.0).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    df["kda"] = (df["player_kills"] + df["player_assists"]) / df["player_deaths"].replace(0, 1)
-    df["is_win"] = df["match_result"] == 1
-
-    df["cs"] = df["last_hits"] + df["denies"]
-    df["cs_per_min"] = (df["cs"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    df["souls"] = df["net_worth"]
-    df["souls_per_min"] = (df["souls"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-
-    # New derived metrics
-    df["deaths_per_min"] = (df["player_deaths"] / df["duration_min"].replace(0, np.nan)).fillna(0.0)
-    df["assist_ratio"] = (df["player_assists"] / (df["player_kills"] + df["player_assists"]).replace(0, np.nan)).fillna(0.0)
+    df = add_derived_metrics(df)
 
     # Heroes
     heroes_df = load_hero_dict()
@@ -298,6 +358,156 @@ def load_all_matches(raw_dir: str) -> pd.DataFrame:
         df["hero_meta_json"] = df["hero_meta_json"].fillna("{}")
 
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_player_stats(raw_dir: str) -> pd.DataFrame:
+    """
+    Loads optional deeper player stats JSON files from data/raw matching PLAYER_STATS_GLOBS.
+    Expected to include account_id somewhere in each record.
+    """
+    base_dir = Path(raw_dir)
+    files: list[Path] = []
+    for pattern in PLAYER_STATS_GLOBS:
+        files.extend(base_dir.glob(pattern))
+    files = sorted(set(files))
+    if not files:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    rows: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        recs = _collect_account_records(payload)
+        for rec in recs:
+            aid = _safe_int(rec.get("account_id"), default=0)
+            if aid <= 0:
+                continue
+            rows.append(
+                {
+                    "account_id": aid,
+                    "player_stats_json": json.dumps(rec, ensure_ascii=False),
+                    "player_stats_source": p.name,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(columns=["account_id", "player_stats_json", "player_stats_source"])
+
+    out = pd.DataFrame(rows)
+    out = out.drop_duplicates(subset=["account_id"], keep="last").reset_index(drop=True)
+    out["account_id"] = out["account_id"].astype(int)
+    out["player_stats_json"] = out["player_stats_json"].astype(str)
+    out["player_stats_source"] = out["player_stats_source"].astype(str)
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def load_player_hero_stats(raw_dir: str) -> pd.DataFrame:
+    """Load hero-level records from local player stats JSON files."""
+    base_dir = Path(raw_dir)
+    files: list[Path] = []
+    for pattern in PLAYER_STATS_GLOBS:
+        files.extend(base_dir.glob(pattern))
+    files = sorted(set(files))
+    if not files:
+        return pd.DataFrame(columns=["account_id", "hero_id", "_stats_source"])
+
+    rows: list[dict[str, Any]] = []
+    for pth in files:
+        try:
+            payload = json.loads(pth.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        for rec in _collect_hero_records(payload):
+            aid = _safe_int(rec.get("account_id"), default=0)
+            hid = _safe_int(rec.get("hero_id"), default=0)
+            if aid <= 0 or hid <= 0:
+                continue
+
+            out_row = dict(rec)
+            out_row["account_id"] = aid
+            out_row["hero_id"] = hid
+            out_row["_stats_source"] = pth.name
+            rows.append(out_row)
+
+    if not rows:
+        return pd.DataFrame(columns=["account_id", "hero_id", "_stats_source"])
+
+    return pd.DataFrame(rows)
+
+
+def build_player_hero_metrics(player_hero_stats: pd.DataFrame, heroes_df: pd.DataFrame) -> pd.DataFrame:
+    """Build per-account per-hero metrics from local hero stats JSON rows."""
+    if player_hero_stats.empty:
+        return pd.DataFrame()
+
+    dfh = player_hero_stats.copy()
+    exclude = {"account_id", "hero_id", "_stats_source"}
+
+    numeric_cols: list[str] = []
+    for c in dfh.columns:
+        if c in exclude:
+            continue
+        num = pd.to_numeric(dfh[c], errors="coerce")
+        if num.notna().any():
+            dfh[c] = num
+            numeric_cols.append(c)
+
+    aggs: dict[str, str] = {"_stats_source": "last"}
+    for c in numeric_cols:
+        aggs[c] = "sum"
+
+    grouped = (
+        dfh.groupby(["account_id", "hero_id"], as_index=False)
+           .agg(aggs)
+           .rename(columns={"_stats_source": "player_stats_source"})
+    )
+
+    if heroes_df is not None and not heroes_df.empty:
+        grouped = grouped.merge(
+            heroes_df[["hero_id", "hero_name", "hero_icon_small", "hero_card", "hero_portrait"]],
+            on="hero_id",
+            how="left",
+        )
+        grouped["hero_display"] = grouped["hero_name"].fillna(grouped["hero_id"].astype(str))
+    else:
+        grouped["hero_display"] = grouped["hero_id"].astype(str)
+        grouped["hero_icon_small"] = ""
+        grouped["hero_card"] = ""
+        grouped["hero_portrait"] = ""
+
+    cols = grouped.columns.tolist()
+    wins_col = _first_existing(cols, ["wins", "win_count", "matches_won"])
+    losses_col = _first_existing(cols, ["losses", "loss_count", "matches_lost"])
+    matches_col = _first_existing(cols, ["matches", "games_played", "match_count", "games"])
+    kills_col = _first_existing(cols, ["kills", "player_kills", "hero_kills"])
+    deaths_col = _first_existing(cols, ["deaths", "player_deaths", "hero_deaths"])
+    assists_col = _first_existing(cols, ["assists", "player_assists", "hero_assists"])
+
+    if matches_col is None and wins_col and losses_col:
+        grouped["matches"] = grouped[wins_col].fillna(0) + grouped[losses_col].fillna(0)
+        matches_col = "matches"
+    elif matches_col:
+        grouped["matches"] = grouped[matches_col].fillna(0)
+
+    if wins_col and "matches" in grouped.columns:
+        grouped["winrate"] = grouped[wins_col] / grouped["matches"].replace(0, np.nan)
+        grouped["winrate"] = grouped["winrate"].fillna(0.0)
+
+    if kills_col and deaths_col and assists_col:
+        grouped["kda"] = (grouped[kills_col] + grouped[assists_col]) / grouped[deaths_col].replace(0, 1)
+
+    display_first = [
+        "account_id", "hero_id", "hero_display", "player_stats_source", "matches", "winrate", "kda",
+        "hero_icon_small", "hero_card", "hero_portrait",
+    ]
+    ordered = [c for c in display_first if c in grouped.columns] + [c for c in grouped.columns if c not in set(display_first)]
+    return grouped[ordered]
 
 
 
@@ -326,8 +536,8 @@ def short_label(name: str, max_len: int = 14) -> str:
 # UI
 # ---------------------------
 
-st.set_page_config(page_title="Deadlock Friend Tracker", layout="wide")
-st.title("Deadlock Friend Tracker")
+st.set_page_config(page_title="Deadcock Tracker", layout="wide")
+st.title("Deadcock Tracker")
 
 
 st.markdown(
@@ -349,15 +559,10 @@ st.markdown(
 
 
 df = load_all_matches(str(RAW_DIR))
+player_hero_stats_raw_df = load_player_hero_stats(str(RAW_DIR))
 if df.empty:
     st.warning("No match JSON files found in data/raw (expected matches_*_*.json).")
     st.stop()
-
-# Status line
-status_bits = []
-status_bits.append(f"Raw files: {len(scan_raw_files())}")
-status_bits.append("Heroes ✅" if HEROES_JSON.exists() else ("Heroes ⚠️" if HEROES_PARQUET.exists() else "Heroes ❌"))
-st.caption(" • ".join(status_bits))
 
 # Sidebar filters
 st.sidebar.header("Filters")
@@ -373,7 +578,7 @@ if st.sidebar.button("Apply filters", key="apply_filters"):
 fdf = df[df["player_label"].isin(selected_players) & df["game_mode_display"].isin(selected_modes)].copy()
 players_filtered = sorted(fdf["player_label"].unique().tolist())
 
-tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser"])
+tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser", "Player Hero Stats"])
 
 
 # ---------------------------
@@ -381,6 +586,7 @@ tabs = st.tabs(["Leaderboard", "Player Drilldown", "Hero Meta", "Hero Browser"])
 # ---------------------------
 with tabs[0]:
     st.subheader("Leaderboard")
+    st.caption("Metric tips: Winrate = wins / matches • KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Assist Ratio = assists / (kills + assists)")
 
     summary = (
         fdf.groupby(["player_label"], as_index=False)
@@ -424,6 +630,8 @@ with tabs[1]:
                    avg_kda=("kda", "mean"),
                    avg_cs_per_min=("cs_per_min", "mean"),
                    avg_souls_per_min=("souls_per_min", "mean"),
+                   avg_deaths_per_min=("deaths_per_min", "mean"),
+                   avg_assist_ratio=("assist_ratio", "mean"),
                    hero_icon_small=("hero_icon_small", "first"),
                    hero_card=("hero_card", "first"),
                    hero_portrait=("hero_portrait", "first"),
@@ -468,6 +676,7 @@ with tabs[1]:
         d1, d2 = st.columns(2)
         d1.metric("Avg Deaths/min", f"{pdf['deaths_per_min'].mean():.2f}")
         d2.metric("Avg Assist Ratio", f"{pdf['assist_ratio'].mean():.2f}")
+        st.caption("Metric tips: KDA = (kills + assists) / max(1, deaths) • CS/min = (last_hits + denies) / match_minutes • Souls/min = net_worth / match_minutes • Deaths/min = deaths / match_minutes • Assist Ratio = assists / (kills + assists)")
 
         st.markdown("#### Win rate by game length")
 
@@ -562,17 +771,6 @@ with tabs[1]:
         table_cols = [c for c in table_cols if c in hero_summary.columns]
         st.dataframe(make_arrow_safe(hero_summary[table_cols]), width="stretch", hide_index=True)
 
-        st.markdown("#### Pick a hero from the table")
-        hero_options = ["(All heroes)"] + hero_summary["hero_display"].tolist()
-        picked = st.selectbox(
-            "Jump to hero",
-            hero_options,
-            index=0 if selected_hero == "(All heroes)" else (hero_options.index(selected_hero) if selected_hero in hero_options else 0),
-            key=f"{key}_picker",
-        )
-        if picked != selected_hero:
-            st.session_state[key] = picked
-            st.rerun()
 
 
 # ---------------------------
@@ -580,6 +778,7 @@ with tabs[1]:
 # ---------------------------
 with tabs[2]:
     st.subheader("Hero Meta (group)")
+    st.caption("Averages are per-match means across the currently filtered players and modes.")
 
     meta = (
         fdf.groupby(["hero_id", "hero_display"], as_index=False)
@@ -604,6 +803,7 @@ with tabs[2]:
 # ---------------------------
 with tabs[3]:
     st.subheader("Hero Browser")
+    st.caption("Browse hero art + a cleaned metadata view from data/heroes.json.")
 
     heroes = (
         df[["hero_id", "hero_display", "hero_icon_small", "hero_card", "hero_portrait", "hero_meta_json"]]
@@ -618,13 +818,31 @@ with tabs[3]:
     colA, colB = st.columns([1, 2], gap="large")
     with colA:
         img = ""
-        for candidate in [hrow.get("hero_card", ""), hrow.get("hero_portrait", ""), hrow.get("hero_icon_small", "")]:
+        for candidate in [hrow.get("hero_icon_small", ""), hrow.get("hero_card", ""), hrow.get("hero_portrait", "")]:
             if isinstance(candidate, str) and candidate:
                 img = candidate
                 break
-        if img:
-            st.image(img, use_container_width=True)
-        st.markdown(f"**Hero ID:** {int(hrow['hero_id'])}")
+
+        with st.container(border=True):
+            if img:
+                st.image(img, width=120)
+            else:
+                st.write("No hero image available")
+            st.markdown(f"**{hrow['hero_display']}**")
+            st.caption(f"Hero ID: {int(hrow['hero_id'])}")
+
+        image_rows = []
+        for label, url in [
+            ("Icon", hrow.get("hero_icon_small", "")),
+            ("Card", hrow.get("hero_card", "")),
+            ("Portrait", hrow.get("hero_portrait", "")),
+        ]:
+            if isinstance(url, str) and url:
+                image_rows.append({"image_type": label, "url": url})
+
+        if image_rows:
+            st.markdown("#### Image URLs")
+            st.dataframe(make_arrow_safe(pd.DataFrame(image_rows)), width="stretch", hide_index=True)
 
     with colB:
         st.markdown("### Metadata")
@@ -632,8 +850,114 @@ with tabs[3]:
             meta_obj = json.loads(hrow.get("hero_meta_json", "{}"))
         except Exception:
             meta_obj = {}
+
         if meta_obj:
-            meta_items = [{"field": k, "value": meta_obj[k]} for k in meta_obj.keys()]
-            st.dataframe(make_arrow_safe(pd.DataFrame(meta_items)), width="stretch", hide_index=True)
+            preferred_order = [
+                "role", "roles", "difficulty", "class", "type", "faction",
+                "primary_attribute", "description", "tagline",
+            ]
+
+            summary_items = []
+            detail_items = []
+            for k, v in meta_obj.items():
+                target = summary_items if k in preferred_order else detail_items
+                target.append({"field": k, "value": v})
+
+            if summary_items:
+                st.markdown("#### Core hero details")
+                st.dataframe(make_arrow_safe(pd.DataFrame(summary_items)), width="stretch", hide_index=True)
+
+            if detail_items:
+                st.markdown("#### Additional hero fields")
+                st.dataframe(make_arrow_safe(pd.DataFrame(detail_items)), width="stretch", hide_index=True)
+
+            with st.expander("View raw hero metadata JSON"):
+                st.json(meta_obj)
         else:
             st.write("No hero metadata available.")
+
+
+# ---------------------------
+# Player Hero Stats (from JSON)
+# ---------------------------
+with tabs[4]:
+    st.subheader("Player Hero Stats")
+    st.caption("Derived from local player hero stats JSON files, linked by account_id + hero_id.")
+
+    if player_hero_stats_raw_df.empty:
+        st.info(
+            f"No hero stats records found in {RAW_DIR} for patterns {PLAYER_STATS_GLOBS}. "
+            "Add files like player_hero_stats_Jake_105260527.json with hero_id/account_id fields."
+        )
+    else:
+        heroes_lookup = load_hero_dict()
+        hero_metrics_df = build_player_hero_metrics(player_hero_stats_raw_df, heroes_lookup)
+
+        all_labels = sorted(fdf["player_label"].unique().tolist())
+        selected_label = st.selectbox("Select Player", all_labels, key="player_hero_stats_select")
+
+        selected_accounts = sorted(
+            {
+                _safe_int(x)
+                for x in fdf[fdf["player_label"] == selected_label]["account_id"].unique().tolist()
+                if _safe_int(x) > 0
+            }
+        )
+
+        hdf = hero_metrics_df[hero_metrics_df["account_id"].isin(selected_accounts)].copy()
+        if hdf.empty:
+            st.warning("No linked hero stats found for this player label/account_id in local stats JSON.")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Heroes tracked", int(hdf["hero_id"].nunique()))
+            if "matches" in hdf.columns:
+                m2.metric("Matches (from JSON)", int(pd.to_numeric(hdf["matches"], errors="coerce").fillna(0).sum()))
+            else:
+                m2.metric("Matches (from JSON)", "n/a")
+            if "winrate" in hdf.columns:
+                m3.metric("Avg Winrate", f"{float(pd.to_numeric(hdf['winrate'], errors='coerce').fillna(0).mean())*100:.2f}%")
+            else:
+                m3.metric("Avg Winrate", "n/a")
+
+            sort_cols = [c for c in ["matches", "hero_display"] if c in hdf.columns]
+            if sort_cols:
+                asc = [False if c == "matches" else True for c in sort_cols]
+                hdf = hdf.sort_values(sort_cols, ascending=asc)
+
+            top = hdf.head(6).copy()
+            st.markdown("#### Top heroes from JSON stats")
+            top_cols = st.columns(6)
+            for i in range(6):
+                with top_cols[i]:
+                    if i >= len(top):
+                        st.write("")
+                        continue
+                    row = top.iloc[i]
+                    img = ""
+                    for c in ["hero_icon_small", "hero_card", "hero_portrait"]:
+                        v = row.get(c, "")
+                        if isinstance(v, str) and v:
+                            img = v
+                            break
+                    if img:
+                        st.image(img, width=42)
+                    st.caption(str(row.get("hero_display", row.get("hero_id", "?"))))
+                    if "matches" in top.columns:
+                        st.caption(f"matches: {float(row.get('matches', 0)):.0f}")
+                    if "winrate" in top.columns:
+                        st.caption(f"wr: {float(row.get('winrate', 0))*100:.1f}%")
+
+            show_cols = ["hero_display", "hero_id", "matches", "winrate", "kda", "player_stats_source"]
+            show_cols = [c for c in show_cols if c in hdf.columns]
+
+            extra_numeric = [
+                c for c in hdf.columns
+                if c not in set(show_cols + ["account_id", "hero_icon_small", "hero_card", "hero_portrait", "hero_name"])
+                and pd.api.types.is_numeric_dtype(hdf[c])
+            ]
+            show_cols.extend(extra_numeric[:8])
+
+            out = hdf[show_cols].copy()
+            if "winrate" in out.columns:
+                out["winrate"] = (out["winrate"] * 100.0).round(2)
+            st.dataframe(make_arrow_safe(out), width="stretch", hide_index=True)
